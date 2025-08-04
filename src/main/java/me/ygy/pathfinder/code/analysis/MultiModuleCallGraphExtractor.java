@@ -10,7 +10,7 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public class CallGraphExtractor {
+public class MultiModuleCallGraphExtractor {
 
     // Custom class to hold method details
     static class MethodNode {
@@ -55,38 +55,68 @@ public class CallGraphExtractor {
 
     public static void main(String[] args) throws IOException {
         // ===== 1. 配置 =====
-        String projectRoot = "/Users/yuguangyuan/code/csc/pc/csc108-etrade-licai-backend"; // 改成你的 WAR 项目路径
-        String warName = "licai"; // 改成构建后生成的 WAR 名（不含 .war）
+        String projectRoot = "/Users/yuguangyuan/code/csc/h5/eagle-maven-online/eagle-parent"; // 改成你的多模块项目根路径
+        List<String> modules = List.of("eagle-common", "zxjt-baseModule", "csc-web-eagle-gmjj"); // 改成你的模块名列表
 
-        List<String> sourcePaths = List.of(projectRoot + "/src/main/java");
-        List<String> classPaths = collectWarClasspath(projectRoot, warName);
+        List<String> sourcePaths = collectSourcePaths(projectRoot, modules);
+        List<String> classPaths = collectMultiModuleClasspath(projectRoot, modules);
 
-        // ===== 2. 遍历源码文件 =====
-        Path sourceRoot = Paths.get(sourcePaths.get(0));
-        Files.walk(sourceRoot)
-                .filter(p -> p.toString().endsWith(".java"))
-                .forEach(path -> processJavaFile(path, classPaths, sourcePaths));
+        // ===== 2. 遍历所有模块的源码文件 =====
+        System.out.println("Starting analysis...");
+        for (String sourceRootStr : sourcePaths) {
+            Path sourceRoot = Paths.get(sourceRootStr);
+            if (Files.exists(sourceRoot)) {
+                Files.walk(sourceRoot)
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .forEach(path -> processJavaFile(path, classPaths, sourcePaths));
+            }
+        }
+        System.out.println("Analysis finished.");
 
         // ===== 3. 打印指定方法的调用链 =====
-        String targetMethodName = "com.csc108.etrade.service.yingxiang.KidmService.getD8000001";
+        String targetMethodName = "com.csc.wt.eagle.gmjj.service.KidmService.getD8000002";
         System.out.println("=== 调用链 for " + targetMethodName + " ===");
         printCallChain(targetMethodName);
     }
 
-    private static List<String> collectWarClasspath(String projectRoot, String warName) throws IOException {
-        List<String> classpathEntries = new ArrayList<>();
-        classpathEntries.add(projectRoot + "/target/classes");
-        Path libPath = Paths.get(projectRoot, "target", warName, "WEB-INF", "lib");
-        if (Files.exists(libPath)) {
-            try (DirectoryStream<Path> jars = Files.newDirectoryStream(libPath, "*.jar")) {
-                for (Path jar : jars) {
-                    classpathEntries.add(jar.toAbsolutePath().toString());
+    private static List<String> collectSourcePaths(String projectRoot, List<String> modules) {
+        return modules.stream()
+                .map(module -> Paths.get(projectRoot, module, "src", "main", "java"))
+                .filter(Files::exists)
+                .map(Path::toAbsolutePath)
+                .map(Path::toString)
+                .collect(Collectors.toList());
+    }
+
+    private static List<String> collectMultiModuleClasspath(String projectRoot, List<String> modules) throws IOException {
+        Set<String> classpathEntries = new HashSet<>();
+        for (String moduleName : modules) {
+            Path modulePath = Paths.get(projectRoot, moduleName);
+
+            Path classesPath = modulePath.resolve("target/classes");
+            if (Files.exists(classesPath)) {
+                classpathEntries.add(classesPath.toAbsolutePath().toString());
+            }
+
+            Path libPath = modulePath.resolve("target/lib");
+            if (Files.exists(libPath) && Files.isDirectory(libPath)) {
+                try (DirectoryStream<Path> jars = Files.newDirectoryStream(libPath, "*.jar")) {
+                    for (Path jar : jars) {
+                        classpathEntries.add(jar.toAbsolutePath().toString());
+                    }
                 }
             }
-        } else {
-            System.err.println("⚠️ 依赖 jar 未找到，请确保已执行 mvn package");
+
+            Path moduleTargetPath = modulePath.resolve("target");
+            if (Files.exists(moduleTargetPath) && Files.isDirectory(moduleTargetPath)) {
+                try (DirectoryStream<Path> jars = Files.newDirectoryStream(moduleTargetPath, "*.jar")) {
+                    for (Path jar : jars) {
+                        classpathEntries.add(jar.toAbsolutePath().toString());
+                    }
+                }
+            }
         }
-        return classpathEntries;
+        return new ArrayList<>(classpathEntries);
     }
 
     private static void processJavaFile(Path filePath, List<String> classpath, List<String> sourcepaths) {
