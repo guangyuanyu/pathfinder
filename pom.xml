@@ -60,6 +60,19 @@
       <version>1.18.24</version>
     </dependency>
 
+    <dependency>
+      <groupId>org.eclipse.jdt</groupId>
+      <artifactId>org.eclipse.jdt.core</artifactId>
+      <version>3.36.0</version> <!-- 或最新 -->
+    </dependency>
+
+    <dependency>
+      <groupId>org.eclipse.platform</groupId>
+      <artifactId>org.eclipse.core.runtime</artifactId>
+      <version>3.27.0</version>
+    </dependency>
+
+
   </dependencies>
 
   <build>
