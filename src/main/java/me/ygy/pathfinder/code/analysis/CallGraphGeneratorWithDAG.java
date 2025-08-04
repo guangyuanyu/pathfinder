@@ -17,6 +17,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
+@Deprecated
 public class CallGraphGeneratorWithDAG {
 
     // 创建调用图

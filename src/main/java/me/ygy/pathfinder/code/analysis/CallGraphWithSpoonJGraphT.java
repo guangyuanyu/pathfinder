@@ -19,6 +19,7 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.Builder;
 
+@Deprecated
 public class CallGraphWithSpoonJGraphT {
 
     private static DefaultDirectedGraph<String, DefaultEdge> callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
