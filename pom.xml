@@ -1,0 +1,101 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>me.ygy</groupId>
+  <artifactId>pathfinder</artifactId>
+  <version>1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>pathfinder</name>
+  <url>http://maven.apache.org</url>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <antlr4.version>4.13.1</antlr4.version>
+    <antlr4.dir>${project.build.directory}/generated-sources/antlr4</antlr4.dir>
+
+      <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+      <maven.compiler.encoding>UTF-8</maven.compiler.encoding>
+      <java.version>21</java.version>
+      <maven.compiler.source>21</maven.compiler.source>
+      <maven.compiler.target>21</maven.compiler.target>
+
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.antlr</groupId>
+      <artifactId>antlr4-runtime</artifactId>
+      <version>${antlr4.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>com.github.javaparser</groupId>
+      <artifactId>javaparser-core</artifactId>
+      <version>3.26.3.1</version>
+    </dependency>
+    <!-- https://mvnrepository.com/artifact/com.github.javaparser/javaparser-symbol-solver-core -->
+    <dependency>
+      <groupId>com.github.javaparser</groupId>
+      <artifactId>javaparser-symbol-solver-core</artifactId>
+      <version>3.26.3.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>fr.inria.gforge.spoon</groupId>
+      <artifactId>spoon-core</artifactId>
+      <version>11.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.jgrapht</groupId>
+      <artifactId>jgrapht-core</artifactId>
+      <version>1.0.0</version> <!-- 选择最新版本 -->
+    </dependency>
+
+<!--    引入lombok-->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <version>1.18.24</version>
+    </dependency>
+
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- 	执行插件 antlr4:antlr4,根据语法文件(.g4)生成解析器(java)代码
+              完整说明参见 antlr4-maven-plugin 官方文档：
+              https://www.antlr.org/api/maven-plugin/latest/plugin-info.html
+              也可以命令行执行 mvn antlr4:help -Ddetail=true -Dgoal=antlr4 查看在线说明
+      -->
+      <plugin>
+        <groupId>org.antlr</groupId>
+        <artifactId>antlr4-maven-plugin</artifactId>
+        <version>${antlr4.version}</version>
+        <executions>
+          <execution>
+            <id>antlr</id>
+            <goals>
+              <goal>antlr4</goal>
+            </goals>
+            <phase>compile</phase>
+            <configuration>
+              <!--指定导入语法和标记文件的位置。-->
+              <libDirectory>src/main/antlr4/imports</libDirectory>
+              <!--ANTLR语法文件(*.g4)所在的目录。-->
+              <sourceDirectory>src/main/java/me/ygy/pathfinder/git/parser/antlr4</sourceDirectory>
+              <!--指定生成Java文件的输出目录。-->
+              <outputDirectory>src/main/java/me/ygy/pathfinder/git/parser/antlr4/generated</outputDirectory>
+              <!--生成解析树侦听器接口和基类。-->
+              <listener>true</listener>
+              <!--生成解析树访问者接口和基类。-->
+              <visitor>true</visitor>
+              <treatWarningsAsErrors>true</treatWarningsAsErrors>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
