@@ -49,7 +49,7 @@ public class MultiModuleCallGraphExtractor {
         }
     }
 
-    private static final DirectedGraph<MethodNode, DefaultEdge> callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
+    private static DirectedGraph<MethodNode, DefaultEdge> callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
     private static final Map<String, MethodNode> methodNodeCache = new HashMap<>();
     private static final List<String> validPackages = List.of("com.csc108.etrade", "com.csc.wt.eagle", "com.linkstec.raptor");
 
@@ -57,7 +57,7 @@ public class MultiModuleCallGraphExtractor {
     private static final Map<String, List<MethodNode>> constantUsageMap = new HashMap<>();
     private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
             "CMD_B", "CMD_99", "CMD_00", "CMD_L", "CMD_WP", "CMD_4",
-            "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4"
+            "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4","CMD_KIDM"
     );
     private static final String TARGET_CLASS_FQN = "com.linkstec.raptor.eagle.common.constant.EagleConstant";
     // ============================================
@@ -65,27 +65,47 @@ public class MultiModuleCallGraphExtractor {
     public static void main(String[] args) throws IOException {
         // ===== 1. 配置 =====
         String projectRoot = "/Users/yuguangyuan/code/csc/h5/eagle-maven-online/eagle-parent"; // 改成你的多模块项目根路径
-        List<String> modules = List.of("eagle-common", "zxjt-baseModule", "eagle-common-api","csc-web-eagle-wtportal"); // 改成你的模块名列表
-        String outputFile = "constant_call_chains.txt"; // 输出文件名
+        List<String> baseModules = List.of("eagle-common", "zxjt-baseModule", "eagle-common-api");
+        List<String> targetModules = List.of(
+                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
+                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
+                "csc-web-eagle-xjgl", "csc-web-eagle-zhms"
+        );
 
-        List<String> sourcePaths = collectSourcePaths(projectRoot, modules);
-        List<String> classPaths = collectMultiModuleClasspath(projectRoot, modules);
+        for (String targetModule : targetModules) {
+            System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
 
-        // ===== 2. 遍历所有模块的源码文件 =====
-        System.out.println("Starting analysis...");
-        for (String sourceRootStr : sourcePaths) {
-            Path sourceRoot = Paths.get(sourceRootStr);
-            if (Files.exists(sourceRoot)) {
-                Files.walk(sourceRoot)
-                    .filter(p -> p.toString().endsWith(".java"))
-                    .forEach(path -> processJavaFile(path, classPaths, sourcePaths));
+            // 清理旧数据
+            callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
+            methodNodeCache.clear();
+            constantUsageMap.clear();
+
+            List<String> currentModules = new ArrayList<>(baseModules);
+            currentModules.add(targetModule);
+
+            List<String> sourcePaths = collectSourcePaths(projectRoot, currentModules);
+            List<String> classPaths = collectMultiModuleClasspath(projectRoot, currentModules);
+
+            // ===== 2. 遍历所有模块的源码文件 =====
+            System.out.println("Starting analysis for " + targetModule + "...");
+            for (String sourceRootStr : sourcePaths) {
+                Path sourceRoot = Paths.get(sourceRootStr);
+                if (Files.exists(sourceRoot)) {
+                    Files.walk(sourceRoot)
+                            .filter(p -> p.toString().endsWith(".java"))
+                            .forEach(path -> processJavaFile(path, classPaths, sourcePaths));
+                }
             }
-        }
-        System.out.println("Analysis finished.");
+            System.out.println("Analysis finished for " + targetModule + ".");
 
-        // ===== 3. 将结果输出到文件 =====
-        writeConstantCallChainsToFile(outputFile);
-        writeConstantCallChainsToCsv("constant_call_chains.csv");
+            // ===== 3. 将结果输出到文件 =====
+            String moduleSuffix = targetModule.replace("csc-web-eagle-", "");
+            String outputTxtFile = "constant_call_chains." + moduleSuffix + ".txt";
+            String outputCsvFile = "constant_call_chains." + moduleSuffix + ".csv";
+
+            writeConstantCallChainsToFile(outputTxtFile);
+            writeConstantCallChainsToCsv(outputCsvFile);
+        }
     }
 
     private static List<String> collectSourcePaths(String projectRoot, List<String> modules) {
@@ -406,7 +426,7 @@ public class MultiModuleCallGraphExtractor {
                     String comment = controllerMethod.comment != null ? controllerMethod.comment.trim().replaceAll("\n", " ").replaceAll(",", ";") : "";
                     String controllerFqn = controllerMethod.fullyQualifiedName;
 
-                    csvSb.append(String.format("\"%s\",\"%s\",\"%s\",\"%s\"\n",
+                    csvSb.append(String.format("%s,%s,%s,%s\n",
                             constantName,
                             url,
                             comment,
