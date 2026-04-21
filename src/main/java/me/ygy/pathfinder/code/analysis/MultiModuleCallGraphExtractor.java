@@ -422,10 +422,12 @@ public class MultiModuleCallGraphExtractor {
         StringBuilder csvSb = new StringBuilder();
         csvSb.append("constant,url,comment,controller_method\n");
 
+        Set<String> seenConstantControllerPairs = new HashSet<>();
+
         for (Map.Entry<String, List<MethodNode>> entry : constantUsageMap.entrySet()) {
             String constantName = entry.getKey();
             for (MethodNode usageMethod : entry.getValue()) {
-                findControllerCallChains(usageMethod, constantName, csvSb);
+                findControllerCallChains(usageMethod, constantName, csvSb, seenConstantControllerPairs);
             }
         }
 
@@ -433,7 +435,8 @@ public class MultiModuleCallGraphExtractor {
         System.out.println("CSV results written to " + outputPath);
     }
 
-    private static void findControllerCallChains(MethodNode targetNode, String constantName, StringBuilder csvSb) {
+    private static void findControllerCallChains(MethodNode targetNode, String constantName, StringBuilder csvSb,
+                                                 Set<String> seenConstantControllerPairs) {
         Queue<List<MethodNode>> queue = new LinkedList<>();
         queue.add(List.of(targetNode));
 
@@ -452,6 +455,11 @@ public class MultiModuleCallGraphExtractor {
                     String url = controllerMethod.mapping != null ? controllerMethod.mapping.replaceAll("[\", \"]", "") : "";
                     String comment = controllerMethod.comment != null ? controllerMethod.comment.trim().replaceAll("\n", " ").replaceAll(",", ";") : "";
                     String controllerFqn = controllerMethod.fullyQualifiedName;
+
+                    String dedupeKey = constantName + "\0" + controllerFqn;
+                    if (!seenConstantControllerPairs.add(dedupeKey)) {
+                        continue;
+                    }
 
                     csvSb.append(String.format("%s,%s,%s,%s\n",
                             constantName,
