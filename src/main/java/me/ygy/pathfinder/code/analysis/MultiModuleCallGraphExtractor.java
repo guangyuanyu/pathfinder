@@ -71,10 +71,10 @@ public class MultiModuleCallGraphExtractor {
 //        List<String> targetModules = List.of(
 //                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
 //                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
-//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms"
+//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl"
 //        );
 
-        List<String> targetModules = List.of("csc-web-eagle-ywbl");
+        List<String> targetModules = List.of("csc-web-eagle-ywbl", "csc-web-eagle-gmjj");
 
         for (String targetModule : targetModules) {
             System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
@@ -177,12 +177,37 @@ public class MultiModuleCallGraphExtractor {
                 private MethodNode currentMethodNode = null;
                 private String classLevelPath = "";
                 private boolean isController = false;
+                // 使用栈保存外层类的状态，避免嵌套(内部)类访问时覆盖外层类的 isController / classLevelPath。
+                // 场景: 如果 Controller 的某个方法定义在内部类之后（例如 GateController.fetchRiskTstSbj），
+                // 而内部类本身不是 Controller，退出内部类后需要恢复外层 Controller 的上下文，否则该方法的 URL 无法提取。
+                private final Deque<Boolean> isControllerStack = new ArrayDeque<>();
+                private final Deque<String> classLevelPathStack = new ArrayDeque<>();
 
                 @Override
                 public boolean visit(TypeDeclaration node) {
-                    isController = hasAnnotation(node.modifiers(), "Controller") || hasAnnotation(node.modifiers(), "RestController");
-                    classLevelPath = getMappingValue(node.modifiers(), "RequestMapping");
+                    isControllerStack.push(isController);
+                    classLevelPathStack.push(classLevelPath);
+
+                    boolean nodeIsController = hasAnnotation(node.modifiers(), "Controller") || hasAnnotation(node.modifiers(), "RestController");
+                    String nodeClassLevelPath = getMappingValue(node.modifiers(), "RequestMapping", "GetMapping", "PostMapping");
+                    if (nodeIsController) {
+                        isController = true;
+                        classLevelPath = nodeClassLevelPath;
+                    } else {
+                        isController = false;
+                        classLevelPath = "";
+                    }
                     return true;
+                }
+
+                @Override
+                public void endVisit(TypeDeclaration node) {
+                    if (!isControllerStack.isEmpty()) {
+                        isController = isControllerStack.pop();
+                    }
+                    if (!classLevelPathStack.isEmpty()) {
+                        classLevelPath = classLevelPathStack.pop();
+                    }
                 }
 
                 @Override
@@ -205,10 +230,19 @@ public class MultiModuleCallGraphExtractor {
                         }
 
                         if (isController) {
-                            String methodLevelPath = getMappingValue(node.modifiers(), "RequestMapping", "GetMapping", "PostMapping");
-                            if (methodLevelPath != null && !methodLevelPath.isEmpty()) {
-                                String combinedPath = (classLevelPath + "/" + methodLevelPath).replaceAll("/+", "/");
-                                currentMethodNode.mapping = combinedPath;
+                            boolean hasMappingAnno = hasAnnotation(node.modifiers(), "RequestMapping")
+                                    || hasAnnotation(node.modifiers(), "GetMapping")
+                                    || hasAnnotation(node.modifiers(), "PostMapping");
+                            if (hasMappingAnno) {
+                                String methodLevelPath = getMappingValue(node.modifiers(), "RequestMapping", "GetMapping", "PostMapping");
+                                String basePath = classLevelPath == null ? "" : classLevelPath;
+                                String subPath = methodLevelPath == null ? "" : methodLevelPath;
+                                // 如果方法级 @RequestMapping 没有 value/path（或为空），则直接使用类级 @RequestMapping 的值作为 URL
+                                String combinedPath = subPath.isEmpty() ? basePath : (basePath + "/" + subPath);
+                                combinedPath = combinedPath.replaceAll("/+", "/");
+                                if (!combinedPath.isEmpty()) {
+                                    currentMethodNode.mapping = combinedPath;
+                                }
                             }
                         }
                     }
