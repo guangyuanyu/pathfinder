@@ -60,17 +60,21 @@ public class MultiModuleCallGraphExtractor {
             "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4","CMD_KIDM"
     );
     private static final String TARGET_CLASS_FQN = "com.linkstec.raptor.eagle.common.constant.EagleConstant";
+    // local interface  constant file class
+    private static final List<String> TARGET_LOCAL_CLASS_NAME_LIST = List.of("InterfaceConsts", "InterfaceCons", "RestInterfaceConsts");
     // ============================================
 
     public static void main(String[] args) throws IOException {
         // ===== 1. 配置 =====
         String projectRoot = "/Users/yuguangyuan/code/csc/h5/eagle-maven-online/eagle-parent"; // 改成你的多模块项目根路径
         List<String> baseModules = List.of("eagle-common", "zxjt-baseModule", "eagle-common-api");
-        List<String> targetModules = List.of(
-                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
-                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
-                "csc-web-eagle-xjgl", "csc-web-eagle-zhms"
-        );
+//        List<String> targetModules = List.of(
+//                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
+//                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
+//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms"
+//        );
+
+        List<String> targetModules = List.of("csc-web-eagle-ywbl");
 
         for (String targetModule : targetModules) {
             System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
@@ -115,6 +119,15 @@ public class MultiModuleCallGraphExtractor {
                 .map(Path::toAbsolutePath)
                 .map(Path::toString)
                 .collect(Collectors.toList());
+    }
+
+    private static boolean isLocalInterface(String qualifiedClassName) {
+        for (String localClassName : TARGET_LOCAL_CLASS_NAME_LIST) {
+            if (qualifiedClassName.contains(localClassName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static List<String> collectMultiModuleClasspath(String projectRoot, List<String> modules) throws IOException {
@@ -167,7 +180,7 @@ public class MultiModuleCallGraphExtractor {
 
                 @Override
                 public boolean visit(TypeDeclaration node) {
-                    isController = hasAnnotation(node.modifiers(), "Controller");
+                    isController = hasAnnotation(node.modifiers(), "Controller") || hasAnnotation(node.modifiers(), "RestController");
                     classLevelPath = getMappingValue(node.modifiers(), "RequestMapping");
                     return true;
                 }
@@ -230,10 +243,24 @@ public class MultiModuleCallGraphExtractor {
                             if (declaringClass != null && TARGET_CLASS_FQN.equals(declaringClass.getQualifiedName())) {
                                 String fieldName = varBinding.getName();
                                 if (TARGET_CONSTANT_PREFIXES.stream().anyMatch(fieldName::startsWith)) {
-                                    String constantFqn = declaringClass.getQualifiedName() + "." + fieldName;
-                                    List<MethodNode> users = constantUsageMap.computeIfAbsent(constantFqn, k -> new ArrayList<>());
+//                                    String constantFqn = declaringClass.getQualifiedName() + "." + fieldName;
+                                    // fieldName去掉开头的CMD_
+                                    fieldName = fieldName.replaceFirst("CMD_", "");
+                                    List<MethodNode> users = constantUsageMap.computeIfAbsent(fieldName, k -> new ArrayList<>());
                                     if (!users.contains(currentMethodNode)) {
                                         users.add(currentMethodNode);
+                                    }
+                                }
+                            } else if (isLocalInterface(declaringClass.getQualifiedName())) {
+//                                String fieldName = varBinding.getName();
+                                // 如果field引用的是static final String定义的变量，并且变量定义的值是以反斜杠开始的/
+                                if (varBinding.getConstantValue() != null && varBinding.getConstantValue() instanceof String) {
+                                    String fieldValue = (String) varBinding.getConstantValue();
+                                    if (fieldValue.startsWith("/") && !fieldValue.endsWith("/")) {
+                                        List<MethodNode> users = constantUsageMap.computeIfAbsent(fieldValue, k -> new ArrayList<>());
+                                        if (!users.contains(currentMethodNode)) {
+                                            users.add(currentMethodNode);
+                                        }
                                     }
                                 }
                             }
