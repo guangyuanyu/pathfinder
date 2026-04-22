@@ -7,6 +7,11 @@ import org.jgrapht.graph.DefaultEdge;
 
 import java.io.IOException;
 import java.nio.file.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -64,17 +69,33 @@ public class MultiModuleCallGraphExtractor {
     private static final List<String> TARGET_LOCAL_CLASS_NAME_LIST = List.of("InterfaceConsts", "InterfaceCons", "RestInterfaceConsts");
     // ============================================
 
-    public static void main(String[] args) throws IOException {
+    /** 与 pathfinder 模块同级的 {@code data/service-usage-analyzer.db}（运行目录一般为 pathfinder 根目录）。 */
+    private static Path resolveServiceUsageAnalyzerDbPath() {
+        return Paths.get(System.getProperty("user.dir"))
+                .resolve("../data/service-usage-analyzer.db")
+                .normalize()
+                .toAbsolutePath();
+    }
+
+    private static final String UPSERT_BACKEND_SERVICE_DEFINE_SQL = """
+            INSERT INTO backend_service_define (project_name, zhisheng_interface, service_url, comment, controller_method)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(project_name, service_url, zhisheng_interface) DO UPDATE SET
+              comment = excluded.comment,
+              controller_method = excluded.controller_method
+            """;
+
+    public static void main(String[] args) throws Exception {
         // ===== 1. 配置 =====
         String projectRoot = "/Users/yuguangyuan/code/csc/h5/eagle-maven-online/eagle-parent"; // 改成你的多模块项目根路径
         List<String> baseModules = List.of("eagle-common", "zxjt-baseModule", "eagle-common-api");
 //        List<String> targetModules = List.of(
 //                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
 //                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
-//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl"
+//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl", "csc-web-eagle-activity"
 //        );
 
-        List<String> targetModules = List.of("csc-web-eagle-ywbl", "csc-web-eagle-gmjj");
+        List<String> targetModules = List.of("csc-web-eagle-activity");
 
         for (String targetModule : targetModules) {
             System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
@@ -108,7 +129,21 @@ public class MultiModuleCallGraphExtractor {
             String outputCsvFile = "constant_call_chains." + moduleSuffix + ".csv";
 
             writeConstantCallChainsToFile(outputTxtFile);
-            writeConstantCallChainsToCsv(outputCsvFile);
+            writeConstantCallChainsToCsvAndSqlite(outputCsvFile, targetModule, resolveServiceUsageAnalyzerDbPath());
+        }
+    }
+
+    static final class BackendServiceRow {
+        final String zhishengInterface;
+        final String serviceUrl;
+        final String comment;
+        final String controllerMethod;
+
+        BackendServiceRow(String zhishengInterface, String serviceUrl, String comment, String controllerMethod) {
+            this.zhishengInterface = zhishengInterface;
+            this.serviceUrl = serviceUrl;
+            this.comment = comment;
+            this.controllerMethod = controllerMethod;
         }
     }
 
@@ -452,24 +487,93 @@ public class MultiModuleCallGraphExtractor {
         }
     }
 
-    private static void writeConstantCallChainsToCsv(String outputPath) throws IOException {
-        StringBuilder csvSb = new StringBuilder();
-        csvSb.append("constant,url,comment,controller_method\n");
+    private static void ensureBackendServiceDefineTable(Connection conn) throws SQLException {
+        try (Statement st = conn.createStatement()) {
+            st.execute("""
+                    CREATE TABLE IF NOT EXISTS backend_service_define (
+                      project_name TEXT NOT NULL,
+                      zhisheng_interface TEXT NOT NULL,
+                      service_url TEXT NOT NULL,
+                      comment TEXT,
+                      controller_method TEXT NOT NULL,
+                      UNIQUE(project_name, service_url, zhisheng_interface)
+                    )
+                    """);
+        }
+    }
 
+    private static final String DELETE_BACKEND_SERVICE_BY_PROJECT_SQL =
+            "DELETE FROM backend_service_define WHERE project_name = ?";
+
+    private static void upsertBackendServiceRows(String projectName, Path dbPath, List<BackendServiceRow> rows)
+            throws SQLException {
+        try {
+            if (!Files.exists(dbPath.getParent())) {
+                Files.createDirectories(dbPath.getParent());
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        String url = "jdbc:sqlite:" + dbPath.toAbsolutePath();
+        try (Connection conn = DriverManager.getConnection(url)) {
+            ensureBackendServiceDefineTable(conn);
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement del = conn.prepareStatement(DELETE_BACKEND_SERVICE_BY_PROJECT_SQL)) {
+                    del.setString(1, projectName);
+                    del.executeUpdate();
+                }
+                if (!rows.isEmpty()) {
+                    try (PreparedStatement ps = conn.prepareStatement(UPSERT_BACKEND_SERVICE_DEFINE_SQL)) {
+                        for (BackendServiceRow row : rows) {
+                            ps.setString(1, projectName);
+                            ps.setString(2, row.zhishengInterface);
+                            ps.setString(3, row.serviceUrl);
+                            ps.setString(4, row.comment);
+                            ps.setString(5, row.controllerMethod);
+                            ps.addBatch();
+                        }
+                        ps.executeBatch();
+                    }
+                }
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private static void writeConstantCallChainsToCsvAndSqlite(String outputPath, String projectName, Path dbPath)
+            throws IOException, SQLException {
+        List<BackendServiceRow> rows = new ArrayList<>();
         Set<String> seenConstantControllerPairs = new HashSet<>();
 
         for (Map.Entry<String, List<MethodNode>> entry : constantUsageMap.entrySet()) {
             String constantName = entry.getKey();
             for (MethodNode usageMethod : entry.getValue()) {
-                findControllerCallChains(usageMethod, constantName, csvSb, seenConstantControllerPairs);
+                findControllerCallChains(usageMethod, constantName, rows, seenConstantControllerPairs);
             }
+        }
+
+        StringBuilder csvSb = new StringBuilder();
+        csvSb.append("zhisheng_interface,service_url,comment,controller_method\n");
+        for (BackendServiceRow row : rows) {
+            csvSb.append(String.format("%s,%s,%s,%s\n",
+                    row.zhishengInterface,
+                    row.serviceUrl,
+                    row.comment,
+                    row.controllerMethod));
         }
 
         Files.writeString(Paths.get(outputPath), csvSb.toString());
         System.out.println("CSV results written to " + outputPath);
+
+        upsertBackendServiceRows(projectName, dbPath, rows);
+        System.out.println("SQLite upsert finished: " + dbPath + " (rows=" + rows.size() + ")");
     }
 
-    private static void findControllerCallChains(MethodNode targetNode, String constantName, StringBuilder csvSb,
+    private static void findControllerCallChains(MethodNode targetNode, String constantName, List<BackendServiceRow> rows,
                                                  Set<String> seenConstantControllerPairs) {
         Queue<List<MethodNode>> queue = new LinkedList<>();
         queue.add(List.of(targetNode));
@@ -495,12 +599,7 @@ public class MultiModuleCallGraphExtractor {
                         continue;
                     }
 
-                    csvSb.append(String.format("%s,%s,%s,%s\n",
-                            constantName,
-                            url,
-                            comment,
-                            controllerFqn
-                    ));
+                    rows.add(new BackendServiceRow(constantName, url, comment, controllerFqn));
                 }
             } else {
                 for (DefaultEdge edge : incomingEdges) {
