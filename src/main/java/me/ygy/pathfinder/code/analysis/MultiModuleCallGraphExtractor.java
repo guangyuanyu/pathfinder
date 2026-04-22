@@ -10,6 +10,7 @@ import java.nio.file.*;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.*;
@@ -60,6 +61,8 @@ public class MultiModuleCallGraphExtractor {
 
     // ===== New fields for constant tracking =====
     private static final Map<String, List<MethodNode>> constantUsageMap = new HashMap<>();
+    /** 与 {@link #constantUsageMap} 的 key 一致：EagleConstant 为去掉 CMD_ 后的名；本地 Interface 常量为路径字符串。 */
+    private static final Map<String, String> constantKeyToConstantComment = new HashMap<>();
     private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
             "CMD_B", "CMD_99", "CMD_00", "CMD_L", "CMD_WP", "CMD_4",
             "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4","CMD_KIDM"
@@ -78,11 +81,12 @@ public class MultiModuleCallGraphExtractor {
     }
 
     private static final String UPSERT_BACKEND_SERVICE_DEFINE_SQL = """
-            INSERT INTO backend_service_define (project_name, zhisheng_interface, service_url, comment, controller_method)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO backend_service_define (project_name, zhisheng_interface, service_url, comment, controller_method, zhisheng_comment)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(project_name, service_url, zhisheng_interface) DO UPDATE SET
               comment = excluded.comment,
-              controller_method = excluded.controller_method
+              controller_method = excluded.controller_method,
+              zhisheng_comment = excluded.zhisheng_comment
             """;
 
     public static void main(String[] args) throws Exception {
@@ -95,7 +99,7 @@ public class MultiModuleCallGraphExtractor {
 //                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl", "csc-web-eagle-activity"
 //        );
 
-        List<String> targetModules = List.of("csc-web-eagle-activity");
+        List<String> targetModules = List.of("csc-web-eagle-gmjj");
 
         for (String targetModule : targetModules) {
             System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
@@ -104,6 +108,7 @@ public class MultiModuleCallGraphExtractor {
             callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
             methodNodeCache.clear();
             constantUsageMap.clear();
+            constantKeyToConstantComment.clear();
 
             List<String> currentModules = new ArrayList<>(baseModules);
             currentModules.add(targetModule);
@@ -138,12 +143,15 @@ public class MultiModuleCallGraphExtractor {
         final String serviceUrl;
         final String comment;
         final String controllerMethod;
+        final String zhishengComment;
 
-        BackendServiceRow(String zhishengInterface, String serviceUrl, String comment, String controllerMethod) {
+        BackendServiceRow(String zhishengInterface, String serviceUrl, String comment, String controllerMethod,
+                           String zhishengComment) {
             this.zhishengInterface = zhishengInterface;
             this.serviceUrl = serviceUrl;
             this.comment = comment;
             this.controllerMethod = controllerMethod;
+            this.zhishengComment = zhishengComment;
         }
     }
 
@@ -199,6 +207,7 @@ public class MultiModuleCallGraphExtractor {
     private static void processJavaFile(Path filePath, List<String> classpath, List<String> sourcepaths) {
         try {
             String code = Files.readString(filePath);
+            final String[] sourceLines = code.split("\\R", -1);
             ASTParser parser = ASTParser.newParser(AST.JLS17);
             parser.setKind(ASTParser.K_COMPILATION_UNIT);
             parser.setResolveBindings(true);
@@ -217,6 +226,46 @@ public class MultiModuleCallGraphExtractor {
                 // 而内部类本身不是 Controller，退出内部类后需要恢复外层 Controller 的上下文，否则该方法的 URL 无法提取。
                 private final Deque<Boolean> isControllerStack = new ArrayDeque<>();
                 private final Deque<String> classLevelPathStack = new ArrayDeque<>();
+
+                @Override
+                public boolean visit(FieldDeclaration node) {
+                    if (!java.lang.reflect.Modifier.isStatic(node.getModifiers())
+                            || !java.lang.reflect.Modifier.isFinal(node.getModifiers())) {
+                        return true;
+                    }
+                    ASTNode parent = node.getParent();
+                    if (!(parent instanceof TypeDeclaration)) {
+                        return true;
+                    }
+                    ITypeBinding classBinding = ((TypeDeclaration) parent).resolveBinding();
+                    if (classBinding == null) {
+                        return true;
+                    }
+                    String qn = classBinding.getQualifiedName();
+                    for (Object o : node.fragments()) {
+                        if (!(o instanceof VariableDeclarationFragment frag)) {
+                            continue;
+                        }
+                        IVariableBinding vb = frag.resolveBinding();
+                        if (vb == null) {
+                            continue;
+                        }
+                        String defComment = extractConstantDefinitionComment(cu, code, sourceLines, node, frag);
+                        if (TARGET_CLASS_FQN.equals(qn)) {
+                            String fname = vb.getName();
+                            if (TARGET_CONSTANT_PREFIXES.stream().anyMatch(fname::startsWith)) {
+                                String key = fname.replaceFirst("CMD_", "");
+                                mergeConstantDefinitionComment(key, defComment);
+                            }
+                        } else if (isLocalInterface(qn)) {
+                            Object cv = vb.getConstantValue();
+                            if (cv instanceof String fv && fv.startsWith("/") && !fv.endsWith("/")) {
+                                mergeConstantDefinitionComment(fv, defComment);
+                            }
+                        }
+                    }
+                    return true;
+                }
 
                 @Override
                 public boolean visit(TypeDeclaration node) {
@@ -402,6 +451,126 @@ public class MultiModuleCallGraphExtractor {
         return validPackages.stream().anyMatch(className::startsWith);
     }
 
+    private static void mergeConstantDefinitionComment(String key, String comment) {
+        if (comment == null || comment.isBlank()) {
+            constantKeyToConstantComment.putIfAbsent(key, "");
+            return;
+        }
+        constantKeyToConstantComment.merge(key, comment, (oldV, newV) -> {
+            if (oldV == null || oldV.isBlank()) {
+                return newV;
+            }
+            if (oldV.equals(newV)) {
+                return oldV;
+            }
+            return oldV + " | " + newV;
+        });
+    }
+
+    /**
+     * 常量定义处：优先取定义行（含分号行）上的行尾/行内注释；若无则取该行往上数第 1、2 行中的注释。
+     */
+    private static String extractConstantDefinitionComment(CompilationUnit cu, String fullSource, String[] sourceLines,
+                                                           FieldDeclaration field, VariableDeclarationFragment frag) {
+        int start = frag.getStartPosition();
+        int end = start + frag.getLength();
+        int semi = -1;
+        for (int i = end - 1; i >= start; i--) {
+            if (fullSource.charAt(i) == ';') {
+                semi = i;
+                break;
+            }
+        }
+        if (semi < 0) {
+            semi = Math.max(start, end - 1);
+        }
+        int line1Based = cu.getLineNumber(semi);
+        if (line1Based < 1) {
+            return "";
+        }
+        int idx = line1Based - 1;
+        if (idx < sourceLines.length) {
+            String defLine = sourceLines[idx];
+            String inline = extractInlineCommentOnConstantDefinitionLine(defLine);
+            if (!inline.isEmpty()) {
+                return normalizeConstantCommentText(inline);
+            }
+        }
+        for (int d = 1; d <= 2; d++) {
+            int li = line1Based - 1 - d;
+            if (li >= 0 && li < sourceLines.length) {
+                String near = extractCommentFromNearbySourceLine(sourceLines[li]);
+                if (!near.isEmpty()) {
+                    return normalizeConstantCommentText(near);
+                }
+            }
+        }
+        return "";
+    }
+
+    // 定义行：分号后的行尾 // 或块注释；或分号前同一行上的块注释 /* ... */；否则取整行最后一个 // 之后内容。
+    private static String extractInlineCommentOnConstantDefinitionLine(String line) {
+        int semi = line.lastIndexOf(';');
+        if (semi >= 0) {
+            String after = line.substring(semi + 1).trim();
+            if (after.startsWith("//")) {
+                return after.substring(2).trim();
+            }
+            if (after.startsWith("/*")) {
+                int close = after.indexOf("*/", 2);
+                if (close > 2) {
+                    return after.substring(2, close).trim();
+                }
+            }
+            String before = line.substring(0, semi);
+            String block = lastBlockCommentOnLine(before);
+            if (!block.isEmpty()) {
+                return block;
+            }
+        }
+        int slash = line.lastIndexOf("//");
+        if (slash >= 0) {
+            return line.substring(slash + 2).trim();
+        }
+        return "";
+    }
+
+    private static String lastBlockCommentOnLine(String beforeSemi) {
+        int open = beforeSemi.lastIndexOf("/*");
+        if (open < 0) {
+            return "";
+        }
+        int close = beforeSemi.indexOf("*/", open + 2);
+        if (close > open) {
+            return beforeSemi.substring(open + 2, close).trim();
+        }
+        return "";
+    }
+
+    private static String extractCommentFromNearbySourceLine(String line) {
+        String t = line.trim();
+        if (t.startsWith("//")) {
+            return t.substring(2).trim();
+        }
+        if (t.startsWith("/**") && t.contains("*/")) {
+            int end = t.indexOf("*/", 3);
+            return t.substring(3, end).replace('*', ' ').replaceAll("\\s+", " ").trim();
+        }
+        if (t.startsWith("/*") && t.contains("*/")) {
+            int end = t.indexOf("*/", 2);
+            return t.substring(2, end).replace('*', ' ').trim();
+        }
+        int slash = line.indexOf("//");
+        if (slash >= 0) {
+            return line.substring(slash + 2).trim();
+        }
+        return "";
+    }
+
+    private static String normalizeConstantCommentText(String raw) {
+        return raw.replace('\r', ' ').replace('\n', ' ').trim().replaceAll(",", ";");
+    }
+
     private static void writeConstantCallChainsToFile(String outputPath) throws IOException {
         StringBuilder sb = new StringBuilder();
         sb.append("===== Static Constant Call Chain Analysis =====\n");
@@ -496,10 +665,38 @@ public class MultiModuleCallGraphExtractor {
                       service_url TEXT NOT NULL,
                       comment TEXT,
                       controller_method TEXT NOT NULL,
+                      zhisheng_comment TEXT,
                       UNIQUE(project_name, service_url, zhisheng_interface)
                     )
                     """);
         }
+        migrateZhishengCommentColumn(conn);
+    }
+
+    /** 新列名 zhisheng_comment；旧库若仅有 constant_comment 则重命名。 */
+    private static void migrateZhishengCommentColumn(Connection conn) throws SQLException {
+        if (tableHasColumn(conn, "backend_service_define", "zhisheng_comment")) {
+            return;
+        }
+        try (Statement st = conn.createStatement()) {
+            if (tableHasColumn(conn, "backend_service_define", "constant_comment")) {
+                st.execute("ALTER TABLE backend_service_define RENAME COLUMN constant_comment TO zhisheng_comment");
+            } else {
+                st.execute("ALTER TABLE backend_service_define ADD COLUMN zhisheng_comment TEXT");
+            }
+        }
+    }
+
+    private static boolean tableHasColumn(Connection conn, String table, String column) throws SQLException {
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                if (column.equalsIgnoreCase(rs.getString("name"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static final String DELETE_BACKEND_SERVICE_BY_PROJECT_SQL =
@@ -531,6 +728,7 @@ public class MultiModuleCallGraphExtractor {
                             ps.setString(3, row.serviceUrl);
                             ps.setString(4, row.comment);
                             ps.setString(5, row.controllerMethod);
+                            ps.setString(6, row.zhishengComment);
                             ps.addBatch();
                         }
                         ps.executeBatch();
@@ -557,13 +755,14 @@ public class MultiModuleCallGraphExtractor {
         }
 
         StringBuilder csvSb = new StringBuilder();
-        csvSb.append("zhisheng_interface,service_url,comment,controller_method\n");
+        csvSb.append("zhisheng_interface,service_url,comment,controller_method,zhisheng_comment\n");
         for (BackendServiceRow row : rows) {
-            csvSb.append(String.format("%s,%s,%s,%s\n",
+            csvSb.append(String.format("%s,%s,%s,%s,%s\n",
                     row.zhishengInterface,
                     row.serviceUrl,
                     row.comment,
-                    row.controllerMethod));
+                    row.controllerMethod,
+                    row.zhishengComment));
         }
 
         Files.writeString(Paths.get(outputPath), csvSb.toString());
@@ -599,7 +798,8 @@ public class MultiModuleCallGraphExtractor {
                         continue;
                     }
 
-                    rows.add(new BackendServiceRow(constantName, url, comment, controllerFqn));
+                    String zhishengComment = constantKeyToConstantComment.getOrDefault(constantName, "");
+                    rows.add(new BackendServiceRow(constantName, url, comment, controllerFqn, zhishengComment));
                 }
             } else {
                 for (DefaultEdge edge : incomingEdges) {
