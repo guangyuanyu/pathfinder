@@ -63,6 +63,12 @@ public class MultiModuleCallGraphExtractor {
     private static final Map<String, List<MethodNode>> constantUsageMap = new HashMap<>();
     /** 与 {@link #constantUsageMap} 的 key 一致：EagleConstant 为去掉 CMD_ 后的名；本地 Interface 常量为路径字符串。 */
     private static final Map<String, String> constantKeyToConstantComment = new HashMap<>();
+    /** {@link IVariableBinding#getKey()}（variableDeclaration）→ 由字面量或同类型内 static final 拼接求出的 URL。 */
+    private static final Map<String, String> localInterfaceFieldKeyToResolvedUrl = new HashMap<>();
+    /** 绑定缺失时的兜底键：类名（优先全限定名） + # + 字段名。 */
+    private static final Map<String, String> localInterfaceFieldNameToResolvedUrl = new HashMap<>();
+    /** 临时调试开关：打印本地接口常量 URL 解析过程。 */
+    private static final boolean DEBUG_LOCAL_INTERFACE_RESOLUTION = true;
     private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
             "CMD_B", "CMD_99", "CMD_00", "CMD_L", "CMD_WP", "CMD_4",
             "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4","CMD_KIDM"
@@ -93,13 +99,13 @@ public class MultiModuleCallGraphExtractor {
         // ===== 1. 配置 =====
         String projectRoot = "/Users/yuguangyuan/code/csc/h5/eagle-maven-online/eagle-parent"; // 改成你的多模块项目根路径
         List<String> baseModules = List.of("eagle-common", "zxjt-baseModule", "eagle-common-api");
-//        List<String> targetModules = List.of(
-//                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
-//                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
-//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl", "csc-web-eagle-activity"
-//        );
+        List<String> targetModules = List.of(
+                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
+                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
+                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl", "csc-web-eagle-activity"
+        );
 
-        List<String> targetModules = List.of("csc-web-eagle-gmjj");
+//        List<String> targetModules = List.of("csc-web-eagle-ywbl");
 
         for (String targetModule : targetModules) {
             System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
@@ -109,6 +115,8 @@ public class MultiModuleCallGraphExtractor {
             methodNodeCache.clear();
             constantUsageMap.clear();
             constantKeyToConstantComment.clear();
+            localInterfaceFieldKeyToResolvedUrl.clear();
+            localInterfaceFieldNameToResolvedUrl.clear();
 
             List<String> currentModules = new ArrayList<>(baseModules);
             currentModules.add(targetModule);
@@ -116,7 +124,16 @@ public class MultiModuleCallGraphExtractor {
             List<String> sourcePaths = collectSourcePaths(projectRoot, currentModules);
             List<String> classPaths = collectMultiModuleClasspath(projectRoot, currentModules);
 
-            // ===== 2. 遍历所有模块的源码文件 =====
+            // ===== 2. 先索引常量定义（含 RestInterfaceConsts 中 A + "/path" 拼接），再分析引用与调用图 =====
+            System.out.println("Indexing constant definitions for " + targetModule + "...");
+            for (String sourceRootStr : sourcePaths) {
+                Path sourceRoot = Paths.get(sourceRootStr);
+                if (Files.exists(sourceRoot)) {
+                    Files.walk(sourceRoot)
+                            .filter(p -> p.toString().endsWith(".java"))
+                            .forEach(path -> indexConstantDefinitions(path, classPaths, sourcePaths));
+                }
+            }
             System.out.println("Starting analysis for " + targetModule + "...");
             for (String sourceRootStr : sourcePaths) {
                 Path sourceRoot = Paths.get(sourceRootStr);
@@ -165,12 +182,54 @@ public class MultiModuleCallGraphExtractor {
     }
 
     private static boolean isLocalInterface(String qualifiedClassName) {
+        if (qualifiedClassName == null || qualifiedClassName.isBlank()) {
+            return false;
+        }
         for (String localClassName : TARGET_LOCAL_CLASS_NAME_LIST) {
             if (qualifiedClassName.contains(localClassName)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static boolean isLocalInterfaceTypeName(String typeName) {
+        if (typeName == null || typeName.isBlank()) {
+            return false;
+        }
+        for (String localClassName : TARGET_LOCAL_CLASS_NAME_LIST) {
+            if (typeName.contains(localClassName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String buildLocalInterfaceFallbackKey(String ownerName, String fieldName) {
+        if (ownerName == null || ownerName.isBlank() || fieldName == null || fieldName.isBlank()) {
+            return null;
+        }
+        return ownerName + "#" + fieldName;
+    }
+
+    private static boolean shouldDebugLocalInterface(String ownerName, String fieldName) {
+        if (!DEBUG_LOCAL_INTERFACE_RESOLUTION) {
+            return false;
+        }
+        String owner = ownerName == null ? "" : ownerName;
+        String field = fieldName == null ? "" : fieldName;
+        return owner.contains("RestInterfaceConsts")
+                || owner.contains("InterfaceConsts")
+                || owner.contains("InterfaceCons")
+                || field.contains("YGT")
+                || field.contains("E0010001");
+    }
+
+    private static void debugLocalInterface(String ownerName, String fieldName, String message) {
+        if (!shouldDebugLocalInterface(ownerName, fieldName)) {
+            return;
+        }
+//        System.out.println("[local-interface-debug] " + ownerName + "#" + fieldName + " -> " + message);
     }
 
     private static List<String> collectMultiModuleClasspath(String projectRoot, List<String> modules) throws IOException {
@@ -204,10 +263,270 @@ public class MultiModuleCallGraphExtractor {
         return new ArrayList<>(classpathEntries);
     }
 
-    private static void processJavaFile(Path filePath, List<String> classpath, List<String> sourcepaths) {
+    private static boolean isLocalInterfacePathConstant(String s) {
+        return s != null && s.startsWith("/") && !s.endsWith("/");
+    }
+
+    /**
+     * 本地接口常量求值时允许中间态字符串（例如 ""、"/BASE"），
+     * 只有在真正登记为接口常量时才要求满足 {@link #isLocalInterfacePathConstant(String)}。
+     */
+    private static boolean isResolvableLocalInterfaceString(String s) {
+        return s != null;
+    }
+
+    /**
+     * 首轮扫描：解析 EagleConstant / Interface* / RestInterfaceConsts 等字段定义，
+     * 填充 {@link #constantKeyToConstantComment} 与 {@link #localInterfaceFieldKeyToResolvedUrl}
+     *（支持 {@code BASE + "/sub"} 形式，{@code getConstantValue()} 常为 null 时由 AST 求值）。
+     */
+    private static void indexConstantDefinitions(Path filePath, List<String> classpath, List<String> sourcepaths) {
         try {
             String code = Files.readString(filePath);
             final String[] sourceLines = code.split("\\R", -1);
+            ASTParser parser = ASTParser.newParser(AST.JLS17);
+            parser.setKind(ASTParser.K_COMPILATION_UNIT);
+            parser.setResolveBindings(true);
+            parser.setBindingsRecovery(true);
+            parser.setUnitName(filePath.getFileName().toString());
+            parser.setEnvironment(classpath.toArray(new String[0]), sourcepaths.toArray(new String[0]), null, true);
+            parser.setSource(code.toCharArray());
+            CompilationUnit cu = (CompilationUnit) parser.createAST(null);
+
+            Map<String, String> fileMemo = new HashMap<>();
+            cu.accept(new ASTVisitor() {
+                @Override
+                public boolean visit(FieldDeclaration node) {
+                    if (!java.lang.reflect.Modifier.isStatic(node.getModifiers())
+                            || !java.lang.reflect.Modifier.isFinal(node.getModifiers())) {
+                        return true;
+                    }
+                    ASTNode parent = node.getParent();
+                    if (!(parent instanceof TypeDeclaration typeNode)) {
+                        return true;
+                    }
+                    ITypeBinding classBinding = typeNode.resolveBinding();
+                    String qn = classBinding != null ? classBinding.getQualifiedName() : typeNode.getName().getIdentifier();
+                    for (Object o : node.fragments()) {
+                        if (!(o instanceof VariableDeclarationFragment frag)) {
+                            continue;
+                        }
+                        IVariableBinding vb = frag.resolveBinding();
+                        String defComment = extractConstantDefinitionComment(cu, code, sourceLines, node, frag);
+                        if (classBinding != null && TARGET_CLASS_FQN.equals(qn) && vb != null) {
+                            String fname = vb.getName();
+                            if (TARGET_CONSTANT_PREFIXES.stream().anyMatch(fname::startsWith)) {
+                                String key = fname.replaceFirst("CMD_", "");
+                                mergeConstantDefinitionComment(key, defComment);
+                            }
+                        } else if (isLocalInterface(qn) || isLocalInterfaceTypeName(typeNode.getName().getIdentifier())) {
+                            debugLocalInterface(qn, frag.getName().getIdentifier(),
+                                    "index start, initializer=" + (frag.getInitializer() == null ? "<null>" : frag.getInitializer()));
+                            String url = resolveLocalInterfaceFieldUrlFromFragment(
+                                    frag, classBinding, typeNode, cu, fileMemo, new HashSet<>());
+                            debugLocalInterface(qn, frag.getName().getIdentifier(), "index resolved url=" + url);
+                            if (isLocalInterfacePathConstant(url)) {
+                                if (vb != null) {
+                                    localInterfaceFieldKeyToResolvedUrl.put(vb.getVariableDeclaration().getKey(), url);
+                                }
+                                String fallbackKey = buildLocalInterfaceFallbackKey(
+                                        classBinding != null ? classBinding.getQualifiedName() : typeNode.getName().getIdentifier(),
+                                        frag.getName().getIdentifier());
+                                if (fallbackKey != null) {
+                                    localInterfaceFieldNameToResolvedUrl.put(fallbackKey, url);
+                                }
+                                mergeConstantDefinitionComment(url, defComment);
+                            }
+                        }
+                    }
+                    return true;
+                }
+            });
+        } catch (Exception e) {
+            System.err.println("❌ Error indexing constants " + filePath + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static VariableDeclarationFragment findFragmentByNameInClass(TypeDeclaration type, String fieldName) {
+        if (type == null || fieldName == null) {
+            return null;
+        }
+        for (FieldDeclaration fd : type.getFields()) {
+            for (Object o : fd.fragments()) {
+                if (o instanceof VariableDeclarationFragment vdf
+                        && fieldName.equals(vdf.getName().getIdentifier())) {
+                    return vdf;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 供顶层 {@code visit(FieldDeclaration)} 直接使用，已知 fragment / 所在 type / classBinding。 */
+    private static String resolveLocalInterfaceFieldUrlFromFragment(
+            VariableDeclarationFragment frag, ITypeBinding owningClass, TypeDeclaration owningType,
+            CompilationUnit cu, Map<String, String> memo, Set<String> stack) {
+        IVariableBinding vb = frag.resolveBinding();
+        String ownerName = owningClass != null ? owningClass.getQualifiedName() : owningType.getName().getIdentifier();
+        String fieldName = frag.getName().getIdentifier();
+        String k = vb != null ? vb.getVariableDeclaration().getKey() : buildLocalInterfaceFallbackKey(ownerName, frag.getName().getIdentifier());
+        if (memo.containsKey(k)) {
+            debugLocalInterface(ownerName, fieldName, "memo hit, key=" + k + ", value=" + memo.get(k));
+            return memo.get(k);
+        }
+        if (!stack.add(k)) {
+            debugLocalInterface(ownerName, fieldName, "cycle detected, key=" + k);
+            return null;
+        }
+        try {
+            if (vb != null) {
+                Object cv = vb.getConstantValue();
+                if (cv instanceof String s && isLocalInterfacePathConstant(s)) {
+                    memo.put(k, s);
+                    debugLocalInterface(ownerName, fieldName, "constantValue hit=" + s);
+                    return s;
+                }
+                debugLocalInterface(ownerName, fieldName, "constantValue=" + cv);
+            }
+            Expression init = frag.getInitializer();
+            if (init == null) {
+                debugLocalInterface(ownerName, fieldName, "initializer is null");
+                return null;
+            }
+            debugLocalInterface(ownerName, fieldName, "evaluate initializer=" + init);
+            String evaluated = evalLocalInterfaceStringInitializer(init, owningClass, owningType, cu, memo, stack);
+            if (isResolvableLocalInterfaceString(evaluated)) {
+                memo.put(k, evaluated);
+                debugLocalInterface(ownerName, fieldName, "evaluated success=" + evaluated);
+                return evaluated;
+            }
+            debugLocalInterface(ownerName, fieldName, "evaluated result invalid=" + evaluated);
+            return null;
+        } finally {
+            stack.remove(k);
+        }
+    }
+
+    private static String evalLocalInterfaceStringInitializer(
+            Expression expr, ITypeBinding owningClass, TypeDeclaration owningType, CompilationUnit cu,
+            Map<String, String> memo, Set<String> stack) {
+        if (expr == null) {
+            return null;
+        }
+        if (expr instanceof StringLiteral sl) {
+            return sl.getLiteralValue();
+        }
+        if (expr instanceof CharacterLiteral cl) {
+            return String.valueOf(cl.charValue());
+        }
+        if (expr instanceof NumberLiteral nl) {
+            return nl.getToken();
+        }
+        if (expr instanceof BooleanLiteral bl) {
+            return Boolean.toString(bl.booleanValue());
+        }
+        if (expr instanceof ParenthesizedExpression pe) {
+            return evalLocalInterfaceStringInitializer(pe.getExpression(), owningClass, owningType, cu, memo, stack);
+        }
+        if (expr instanceof CastExpression ce) {
+            return evalLocalInterfaceStringInitializer(ce.getExpression(), owningClass, owningType, cu, memo, stack);
+        }
+        if (expr instanceof InfixExpression ie && ie.getOperator() == InfixExpression.Operator.PLUS) {
+            StringBuilder sb = new StringBuilder();
+            String left = evalLocalInterfaceStringInitializer(ie.getLeftOperand(), owningClass, owningType, cu, memo, stack);
+            if (left == null) return null;
+            sb.append(left);
+            String right = evalLocalInterfaceStringInitializer(ie.getRightOperand(), owningClass, owningType, cu, memo, stack);
+            if (right == null) return null;
+            sb.append(right);
+            for (Object ex : ie.extendedOperands()) {
+                String p = evalLocalInterfaceStringInitializer((Expression) ex, owningClass, owningType, cu, memo, stack);
+                if (p == null) return null;
+                sb.append(p);
+            }
+            debugLocalInterface(owningClass != null ? owningClass.getQualifiedName() : owningType.getName().getIdentifier(),
+                    "<expr>", "infix '" + ie + "' => " + sb);
+            return sb.toString();
+        }
+        if (expr instanceof Name name) {
+            return resolveNameValueInClass(name, owningClass, owningType, cu, memo, stack);
+        }
+        return null;
+    }
+
+    /**
+     * 解析 {@code Name} 引用的常量值：
+     * <ol>
+     *   <li>优先用 {@link IVariableBinding#getConstantValue()}</li>
+     *   <li>其次按名字在同一 {@link TypeDeclaration} 内递归求值（兼容绑定不完整的情况）</li>
+     *   <li>最后按绑定所在类型是否为同一 qualifiedName 递归</li>
+     * </ol>
+     */
+    private static String resolveNameValueInClass(
+            Name name, ITypeBinding owningClass, TypeDeclaration owningType, CompilationUnit cu,
+            Map<String, String> memo, Set<String> stack) {
+        String ownerName = owningClass != null ? owningClass.getQualifiedName() : owningType.getName().getIdentifier();
+        IBinding binding = name.resolveBinding();
+        if (binding instanceof IVariableBinding refVb && refVb.isField()
+                && java.lang.reflect.Modifier.isStatic(refVb.getModifiers())) {
+            Object cv = refVb.getConstantValue();
+            if (cv instanceof String s) {
+                debugLocalInterface(ownerName, refVb.getName(), "name '" + name + "' constantValue=" + s);
+                return s;
+            }
+            ITypeBinding refDecl = refVb.getDeclaringClass();
+            String refQn = refDecl == null ? null : refDecl.getQualifiedName();
+            String ownQn = owningClass == null ? null : owningClass.getQualifiedName();
+            if ((refQn != null && refQn.equals(ownQn))
+                    || (refDecl != null && owningType != null
+                    && refDecl.getName().equals(owningType.getName().getIdentifier()))) {
+                VariableDeclarationFragment refFrag = findFragmentByNameInClass(owningType, refVb.getName());
+                if (refFrag != null) {
+                    debugLocalInterface(ownerName, refVb.getName(), "name '" + name + "' recurse by binding");
+                    return resolveLocalInterfaceFieldUrlFromFragment(refFrag, owningClass, owningType, cu, memo, stack);
+                }
+            }
+            debugLocalInterface(ownerName, refVb.getName(), "name '" + name + "' unresolved by binding");
+            return null;
+        }
+        // 绑定缺失时按简单名在同类中找
+        String simple = name instanceof SimpleName sn ? sn.getIdentifier()
+                : name instanceof QualifiedName qn ? qn.getName().getIdentifier() : null;
+        if (simple != null) {
+            VariableDeclarationFragment refFrag = findFragmentByNameInClass(owningType, simple);
+            if (refFrag != null) {
+                debugLocalInterface(ownerName, simple, "name '" + name + "' recurse by simple name");
+                return resolveLocalInterfaceFieldUrlFromFragment(refFrag, owningClass, owningType, cu, memo, stack);
+            }
+        }
+        debugLocalInterface(ownerName, simple, "name '" + name + "' unresolved");
+        return null;
+    }
+
+    private static String resolveLocalInterfaceUrlForUsage(IVariableBinding varBinding) {
+        Object cv = varBinding.getConstantValue();
+        if (cv instanceof String s && isLocalInterfacePathConstant(s)) {
+            return s;
+        }
+        String k = varBinding.getVariableDeclaration().getKey();
+        String resolved = localInterfaceFieldKeyToResolvedUrl.get(k);
+        if (resolved != null) {
+            return resolved;
+        }
+        ITypeBinding declaringClass = varBinding.getDeclaringClass();
+        String fallbackKey = buildLocalInterfaceFallbackKey(
+                declaringClass != null ? declaringClass.getQualifiedName() : null,
+                varBinding.getName());
+        if (fallbackKey != null) {
+            return localInterfaceFieldNameToResolvedUrl.get(fallbackKey);
+        }
+        return null;
+    }
+
+    private static void processJavaFile(Path filePath, List<String> classpath, List<String> sourcepaths) {
+        try {
+            String code = Files.readString(filePath);
             ASTParser parser = ASTParser.newParser(AST.JLS17);
             parser.setKind(ASTParser.K_COMPILATION_UNIT);
             parser.setResolveBindings(true);
@@ -226,46 +545,6 @@ public class MultiModuleCallGraphExtractor {
                 // 而内部类本身不是 Controller，退出内部类后需要恢复外层 Controller 的上下文，否则该方法的 URL 无法提取。
                 private final Deque<Boolean> isControllerStack = new ArrayDeque<>();
                 private final Deque<String> classLevelPathStack = new ArrayDeque<>();
-
-                @Override
-                public boolean visit(FieldDeclaration node) {
-                    if (!java.lang.reflect.Modifier.isStatic(node.getModifiers())
-                            || !java.lang.reflect.Modifier.isFinal(node.getModifiers())) {
-                        return true;
-                    }
-                    ASTNode parent = node.getParent();
-                    if (!(parent instanceof TypeDeclaration)) {
-                        return true;
-                    }
-                    ITypeBinding classBinding = ((TypeDeclaration) parent).resolveBinding();
-                    if (classBinding == null) {
-                        return true;
-                    }
-                    String qn = classBinding.getQualifiedName();
-                    for (Object o : node.fragments()) {
-                        if (!(o instanceof VariableDeclarationFragment frag)) {
-                            continue;
-                        }
-                        IVariableBinding vb = frag.resolveBinding();
-                        if (vb == null) {
-                            continue;
-                        }
-                        String defComment = extractConstantDefinitionComment(cu, code, sourceLines, node, frag);
-                        if (TARGET_CLASS_FQN.equals(qn)) {
-                            String fname = vb.getName();
-                            if (TARGET_CONSTANT_PREFIXES.stream().anyMatch(fname::startsWith)) {
-                                String key = fname.replaceFirst("CMD_", "");
-                                mergeConstantDefinitionComment(key, defComment);
-                            }
-                        } else if (isLocalInterface(qn)) {
-                            Object cv = vb.getConstantValue();
-                            if (cv instanceof String fv && fv.startsWith("/") && !fv.endsWith("/")) {
-                                mergeConstantDefinitionComment(fv, defComment);
-                            }
-                        }
-                    }
-                    return true;
-                }
 
                 @Override
                 public boolean visit(TypeDeclaration node) {
@@ -370,15 +649,11 @@ public class MultiModuleCallGraphExtractor {
                                     }
                                 }
                             } else if (isLocalInterface(declaringClass.getQualifiedName())) {
-//                                String fieldName = varBinding.getName();
-                                // 如果field引用的是static final String定义的变量，并且变量定义的值是以反斜杠开始的/
-                                if (varBinding.getConstantValue() != null && varBinding.getConstantValue() instanceof String) {
-                                    String fieldValue = (String) varBinding.getConstantValue();
-                                    if (fieldValue.startsWith("/") && !fieldValue.endsWith("/")) {
-                                        List<MethodNode> users = constantUsageMap.computeIfAbsent(fieldValue, k -> new ArrayList<>());
-                                        if (!users.contains(currentMethodNode)) {
-                                            users.add(currentMethodNode);
-                                        }
+                                String fieldValue = resolveLocalInterfaceUrlForUsage(varBinding.getVariableDeclaration());
+                                if (fieldValue != null) {
+                                    List<MethodNode> users = constantUsageMap.computeIfAbsent(fieldValue, k -> new ArrayList<>());
+                                    if (!users.contains(currentMethodNode)) {
+                                        users.add(currentMethodNode);
                                     }
                                 }
                             }

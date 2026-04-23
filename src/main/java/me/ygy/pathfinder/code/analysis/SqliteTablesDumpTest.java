@@ -25,7 +25,7 @@ public class SqliteTablesDumpTest {
 
         try (Connection conn = DriverManager.getConnection(jdbcUrl)) {
             dumpTable(conn, "backend_service_define");
-            dumpTable(conn, "frontend_service_usage");
+//            dumpTable(conn, "frontend_service_usage");
         }
     }
 
