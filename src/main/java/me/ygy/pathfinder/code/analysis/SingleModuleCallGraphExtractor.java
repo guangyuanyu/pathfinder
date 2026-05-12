@@ -6,17 +6,16 @@ import org.jgrapht.graph.DefaultDirectedGraph;
 import org.jgrapht.graph.DefaultEdge;
 
 import java.io.IOException;
-import java.nio.file.*;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.Statement;
+import java.sql.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public class MultiModuleCallGraphExtractor {
+public class SingleModuleCallGraphExtractor {
 
     // Custom class to hold method details
     static class MethodNode {
@@ -61,7 +60,7 @@ public class MultiModuleCallGraphExtractor {
 
     // ===== New fields for constant tracking =====
     private static final Map<String, List<MethodNode>> constantUsageMap = new HashMap<>();
-    /** 与 {@link #constantUsageMap} 的 key 一致：优先使用解析出的 URL/常量值。 */
+    /** 与 {@link #constantUsageMap} 的 key 一致：EagleConstant 为去掉 CMD_ 后的名；本地 Interface 常量为路径字符串。 */
     private static final Map<String, String> constantKeyToConstantComment = new HashMap<>();
     /** EagleConstant: field binding key -> 解析后的 URL/常量值。 */
     private static final Map<String, String> eagleConstantFieldKeyToResolvedValue = new HashMap<>();
@@ -72,17 +71,14 @@ public class MultiModuleCallGraphExtractor {
     /** 绑定缺失时的兜底键：类名（优先全限定名） + # + 字段名。 */
     private static final Map<String, String> localInterfaceFieldNameToResolvedUrl = new HashMap<>();
     /** 临时调试开关：打印本地接口常量 URL 解析过程。 */
-    private static final boolean DEBUG_LOCAL_INTERFACE_RESOLUTION = false;
-//    private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
-//            "CMD_B", "CMD_99", "CMD_00", "CMD_L", "CMD_WP", "CMD_4","CMD_S","CMD_Y","CMD_T","CMD_C",
-//            "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4","CMD_KIDM"
-//    );
-private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
-        "CMD_"
-);
-    private static final String TARGET_CLASS_FQN = "com.linkstec.raptor.eagle.common.constant.EagleConstant";
+    private static final boolean DEBUG_LOCAL_INTERFACE_RESOLUTION = true;
+    private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
+            "CMD_B", "CMD_99", "CMD_00", "CMD_L", "CMD_WP", "CMD_4", "CMD_S",
+            "RZRQ_CMD_4", "RZRQ_CMD_4", "CMD_KUAS", "CMD_KFMS", "CMD_RZRQ_4","CMD_KIDM"
+    );
+    private static final String TARGET_CLASS_FQN = "com.csc108.etrade.support.EtradeConstant";
     // local interface  constant file class
-    private static final List<String> TARGET_LOCAL_CLASS_NAME_LIST = List.of("InterfaceConsts", "InterfaceCons", "RestInterfaceConsts");
+    private static final List<String> TARGET_LOCAL_CLASS_NAME_LIST = List.of("InterfaceConsts", "YGTConstants", "GmjjIntefaceConsts", "GmjjIntefaceConsts");
     // ============================================
 
     /** 与 pathfinder 模块同级的 {@code data/service-usage-analyzer.db}（运行目录一般为 pathfinder 根目录）。 */
@@ -104,65 +100,57 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
             """;
 
     public static void main(String[] args) throws Exception {
-        // ===== 1. 配置 =====
-        String projectRoot = "/Users/yuguangyuan/code/csc/h5/eagle-maven-online/eagle-parent"; // 改成你的多模块项目根路径
-        List<String> baseModules = List.of("eagle-common", "zxjt-baseModule", "eagle-common-api");
-//        List<String> targetModules = List.of(
-//                "csc-web-eagle-wtportal", "csc-web-eagle-gmjj", "csc-web-eagle-mallcenter",
-//                "csc-web-eagle-gmcrm", "csc-web-eagle-hyfw", "csc-web-eagle-finance",
-//                "csc-web-eagle-xjgl", "csc-web-eagle-zhms", "csc-web-eagle-ywbl", "csc-web-eagle-activity"
-//        );
+        // ===== 1. 配置（单 module 项目）=====
+        // 传参优先：args[0]=projectRoot, args[1]=projectName
+        String projectRoot = args != null && args.length > 0
+                ? args[0]
+                : "/Users/yuguangyuan/code/csc/pc/csc108-etrade-licai-backend"; // 改成你的单 module 项目根路径
+        String projectName = args != null && args.length > 1
+                ? args[1]
+                : Paths.get(projectRoot).getFileName().toString();
 
-        List<String> targetModules = List.of("csc-web-eagle-mallcenter");
+        System.out.println("\n\nProcessing single-module project: " + projectName
+                + "\nProject root: " + projectRoot
+                + "\n====================================");
 
-        for (String targetModule : targetModules) {
-            System.out.println(" \n\nProcessing module: " + targetModule + " \n====================================");
+        // 清理旧数据
+        callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
+        methodNodeCache.clear();
+        constantUsageMap.clear();
+        constantKeyToConstantComment.clear();
+        localInterfaceFieldKeyToResolvedUrl.clear();
+        localInterfaceFieldNameToResolvedUrl.clear();
 
-            // 清理旧数据
-            callGraph = new DefaultDirectedGraph<>(DefaultEdge.class);
-            methodNodeCache.clear();
-            constantUsageMap.clear();
-            constantKeyToConstantComment.clear();
-            eagleConstantFieldKeyToResolvedValue.clear();
-            eagleConstantFieldNameToResolvedValue.clear();
-            localInterfaceFieldKeyToResolvedUrl.clear();
-            localInterfaceFieldNameToResolvedUrl.clear();
+        List<String> sourcePaths = collectSingleModuleSourcePaths(projectRoot);
+        List<String> classPaths = collectSingleModuleClasspath(projectRoot);
 
-            List<String> currentModules = new ArrayList<>(baseModules);
-            currentModules.add(targetModule);
-
-            List<String> sourcePaths = collectSourcePaths(projectRoot, currentModules);
-            List<String> classPaths = collectMultiModuleClasspath(projectRoot, currentModules);
-
-            // ===== 2. 先索引常量定义（含 RestInterfaceConsts 中 A + "/path" 拼接），再分析引用与调用图 =====
-            System.out.println("Indexing constant definitions for " + targetModule + "...");
-            for (String sourceRootStr : sourcePaths) {
-                Path sourceRoot = Paths.get(sourceRootStr);
-                if (Files.exists(sourceRoot)) {
-                    Files.walk(sourceRoot)
-                            .filter(p -> p.toString().endsWith(".java"))
-                            .forEach(path -> indexConstantDefinitions(path, classPaths, sourcePaths));
-                }
+        // ===== 2. 先索引常量定义（含 RestInterfaceConsts 中 A + "/path" 拼接），再分析引用与调用图 =====
+        System.out.println("Indexing constant definitions...");
+        for (String sourceRootStr : sourcePaths) {
+            Path sourceRoot = Paths.get(sourceRootStr);
+            if (Files.exists(sourceRoot)) {
+                Files.walk(sourceRoot)
+                        .filter(p -> p.toString().endsWith(".java"))
+                        .forEach(path -> indexConstantDefinitions(path, classPaths, sourcePaths));
             }
-            System.out.println("Starting analysis for " + targetModule + "...");
-            for (String sourceRootStr : sourcePaths) {
-                Path sourceRoot = Paths.get(sourceRootStr);
-                if (Files.exists(sourceRoot)) {
-                    Files.walk(sourceRoot)
-                            .filter(p -> p.toString().endsWith(".java"))
-                            .forEach(path -> processJavaFile(path, classPaths, sourcePaths));
-                }
-            }
-            System.out.println("Analysis finished for " + targetModule + ".");
-
-            // ===== 3. 将结果输出到文件 =====
-            String moduleSuffix = targetModule.replace("csc-web-eagle-", "");
-            String outputTxtFile = "constant_call_chains." + moduleSuffix + ".txt";
-            String outputCsvFile = "constant_call_chains." + moduleSuffix + ".csv";
-
-            writeConstantCallChainsToFile(outputTxtFile);
-            writeConstantCallChainsToCsvAndSqlite(outputCsvFile, targetModule, resolveServiceUsageAnalyzerDbPath());
         }
+        System.out.println("Starting analysis...");
+        for (String sourceRootStr : sourcePaths) {
+            Path sourceRoot = Paths.get(sourceRootStr);
+            if (Files.exists(sourceRoot)) {
+                Files.walk(sourceRoot)
+                        .filter(p -> p.toString().endsWith(".java"))
+                        .forEach(path -> processJavaFile(path, classPaths, sourcePaths));
+            }
+        }
+        System.out.println("Analysis finished for " + projectName + ".");
+
+        // ===== 3. 将结果输出到文件 =====
+        String outputTxtFile = "constant_call_chains." + projectName + ".txt";
+        String outputCsvFile = "constant_call_chains." + projectName + ".csv";
+
+        writeConstantCallChainsToFile(outputTxtFile);
+        writeConstantCallChainsToCsvAndSqlite(outputCsvFile, projectName, resolveServiceUsageAnalyzerDbPath());
     }
 
     static final class BackendServiceRow {
@@ -189,6 +177,15 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
                 .map(Path::toAbsolutePath)
                 .map(Path::toString)
                 .collect(Collectors.toList());
+    }
+
+    private static List<String> collectSingleModuleSourcePaths(String projectRoot) {
+        Path mainJava = Paths.get(projectRoot, "src", "main", "java");
+        if (Files.exists(mainJava)) {
+            return List.of(mainJava.toAbsolutePath().toString());
+        }
+        // 兜底：有些项目源码不在标准 Maven 目录下；这里至少保证不会 NPE
+        return List.of();
     }
 
     private static boolean isLocalInterface(String qualifiedClassName) {
@@ -222,13 +219,6 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
         return ownerName + "#" + fieldName;
     }
 
-    private static String buildEagleConstantFallbackKey(String ownerName, String fieldName) {
-        if (ownerName == null || ownerName.isBlank() || fieldName == null || fieldName.isBlank()) {
-            return null;
-        }
-        return ownerName + "#" + fieldName;
-    }
-
     private static boolean shouldDebugLocalInterface(String ownerName, String fieldName) {
         if (!DEBUG_LOCAL_INTERFACE_RESOLUTION) {
             return false;
@@ -246,7 +236,7 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
         if (!shouldDebugLocalInterface(ownerName, fieldName)) {
             return;
         }
-        System.out.println("[local-interface-debug] " + ownerName + "#" + fieldName + " -> " + message);
+//        System.out.println("[local-interface-debug] " + ownerName + "#" + fieldName + " -> " + message);
     }
 
     private static List<String> collectMultiModuleClasspath(String projectRoot, List<String> modules) throws IOException {
@@ -280,12 +270,38 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
         return new ArrayList<>(classpathEntries);
     }
 
-    private static boolean isLocalInterfacePathConstant(String s) {
-        return s != null && s.startsWith("/") && !s.endsWith("/");
+    private static List<String> collectSingleModuleClasspath(String projectRoot) throws IOException {
+        Set<String> classpathEntries = new HashSet<>();
+        Path modulePath = Paths.get(projectRoot);
+
+        Path classesPath = modulePath.resolve("target/classes");
+        if (Files.exists(classesPath)) {
+            classpathEntries.add(classesPath.toAbsolutePath().toString());
+        }
+
+        Path libPath = modulePath.resolve("target/lib");
+        if (Files.exists(libPath) && Files.isDirectory(libPath)) {
+            try (DirectoryStream<Path> jars = Files.newDirectoryStream(libPath, "*.jar")) {
+                for (Path jar : jars) {
+                    classpathEntries.add(jar.toAbsolutePath().toString());
+                }
+            }
+        }
+
+        Path moduleTargetPath = modulePath.resolve("target");
+        if (Files.exists(moduleTargetPath) && Files.isDirectory(moduleTargetPath)) {
+            try (DirectoryStream<Path> jars = Files.newDirectoryStream(moduleTargetPath, "*.jar")) {
+                for (Path jar : jars) {
+                    classpathEntries.add(jar.toAbsolutePath().toString());
+                }
+            }
+        }
+
+        return new ArrayList<>(classpathEntries);
     }
 
-    private static boolean isResolvedConstantKey(String s) {
-        return s != null && !s.isBlank();
+    private static boolean isLocalInterfacePathConstant(String s) {
+        return s != null && s.startsWith("/") && !s.endsWith("/");
     }
 
     /**
@@ -375,6 +391,53 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
             System.err.println("❌ Error indexing constants " + filePath + ": " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    private static String buildEagleConstantFallbackKey(String ownerName, String fieldName) {
+        if (ownerName == null || ownerName.isBlank() || fieldName == null || fieldName.isBlank()) {
+            return null;
+        }
+        return ownerName + "#" + fieldName;
+    }
+
+    private static String resolveEagleConstantValue(
+            IVariableBinding fieldBinding, ITypeBinding owningClass, TypeDeclaration owningType,
+            VariableDeclarationFragment frag, CompilationUnit cu, Map<String, String> memo, Set<String> stack) {
+        IVariableBinding vb = fieldBinding.getVariableDeclaration();
+        String cacheKey = vb.getKey();
+        if (memo.containsKey(cacheKey)) {
+            return memo.get(cacheKey);
+        }
+        if (!stack.add(cacheKey)) {
+            return null;
+        }
+        try {
+            Object cv = vb.getConstantValue();
+            if (cv instanceof String s && isResolvedConstantKey(s)) {
+                memo.put(cacheKey, s);
+                return s;
+            }
+            Expression init = frag.getInitializer();
+            if (init == null) {
+                String fallback = vb.getName().replaceFirst("CMD_", "");
+                memo.put(cacheKey, fallback);
+                return fallback;
+            }
+            String evaluated = evalLocalInterfaceStringInitializer(init, owningClass, owningType, cu, memo, stack);
+            if (isResolvedConstantKey(evaluated)) {
+                memo.put(cacheKey, evaluated);
+                return evaluated;
+            }
+            String fallback = vb.getName().replaceFirst("CMD_", "");
+            memo.put(cacheKey, fallback);
+            return fallback;
+        } finally {
+            stack.remove(cacheKey);
+        }
+    }
+
+    private static boolean isResolvedConstantKey(String s) {
+        return s != null && !s.isBlank();
     }
 
     private static VariableDeclarationFragment findFragmentByNameInClass(TypeDeclaration type, String fieldName) {
@@ -484,42 +547,6 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
         return null;
     }
 
-    private static String resolveEagleConstantValue(
-            IVariableBinding fieldBinding, ITypeBinding owningClass, TypeDeclaration owningType,
-            VariableDeclarationFragment frag, CompilationUnit cu, Map<String, String> memo, Set<String> stack) {
-        IVariableBinding vb = fieldBinding.getVariableDeclaration();
-        String cacheKey = vb.getKey();
-        if (memo.containsKey(cacheKey)) {
-            return memo.get(cacheKey);
-        }
-        if (!stack.add(cacheKey)) {
-            return null;
-        }
-        try {
-            Object cv = vb.getConstantValue();
-            if (cv instanceof String s && isResolvedConstantKey(s)) {
-                memo.put(cacheKey, s);
-                return s;
-            }
-            Expression init = frag.getInitializer();
-            if (init == null) {
-                String fallback = vb.getName().replaceFirst("CMD_", "");
-                memo.put(cacheKey, fallback);
-                return fallback;
-            }
-            String evaluated = evalLocalInterfaceStringInitializer(init, owningClass, owningType, cu, memo, stack);
-            if (isResolvedConstantKey(evaluated)) {
-                memo.put(cacheKey, evaluated);
-                return evaluated;
-            }
-            String fallback = vb.getName().replaceFirst("CMD_", "");
-            memo.put(cacheKey, fallback);
-            return fallback;
-        } finally {
-            stack.remove(cacheKey);
-        }
-    }
-
     /**
      * 解析 {@code Name} 引用的常量值：
      * <ol>
@@ -587,29 +614,6 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
             return localInterfaceFieldNameToResolvedUrl.get(fallbackKey);
         }
         return null;
-    }
-
-    private static String resolveEagleConstantKeyForUsage(IVariableBinding varBinding) {
-        Object cv = varBinding.getConstantValue();
-        if (cv instanceof String s && isResolvedConstantKey(s)) {
-            return s;
-        }
-        String bindingKey = varBinding.getVariableDeclaration().getKey();
-        String resolved = eagleConstantFieldKeyToResolvedValue.get(bindingKey);
-        if (resolved != null) {
-            return resolved;
-        }
-        ITypeBinding declaringClass = varBinding.getDeclaringClass();
-        String fallbackKey = buildEagleConstantFallbackKey(
-                declaringClass != null ? declaringClass.getQualifiedName() : null,
-                varBinding.getName());
-        if (fallbackKey != null) {
-            resolved = eagleConstantFieldNameToResolvedValue.get(fallbackKey);
-            if (resolved != null) {
-                return resolved;
-            }
-        }
-        return varBinding.getName().replaceFirst("CMD_", "");
     }
 
     private static void processJavaFile(Path filePath, List<String> classpath, List<String> sourcepaths) {
@@ -728,8 +732,10 @@ private static final List<String> TARGET_CONSTANT_PREFIXES = List.of(
                             if (declaringClass != null && TARGET_CLASS_FQN.equals(declaringClass.getQualifiedName())) {
                                 String fieldName = varBinding.getName();
                                 if (TARGET_CONSTANT_PREFIXES.stream().anyMatch(fieldName::startsWith)) {
-                                    String constantKey = resolveEagleConstantKeyForUsage(varBinding.getVariableDeclaration());
-                                    List<MethodNode> users = constantUsageMap.computeIfAbsent(constantKey, k -> new ArrayList<>());
+//                                    String constantFqn = declaringClass.getQualifiedName() + "." + fieldName;
+                                    // fieldName去掉开头的CMD_
+                                    fieldName = fieldName.replaceFirst("CMD_", "");
+                                    List<MethodNode> users = constantUsageMap.computeIfAbsent(fieldName, k -> new ArrayList<>());
                                     if (!users.contains(currentMethodNode)) {
                                         users.add(currentMethodNode);
                                     }
